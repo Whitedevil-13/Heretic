@@ -11,7 +11,6 @@ from typing import Any, cast
 import bitsandbytes.functional as BNB_F
 import torch
 import torch.linalg as LA
-import torch.nn.functional as F
 from optuna import Trial
 from peft.tuners.lora.layer import Linear
 from pydantic import (
@@ -317,18 +316,33 @@ class ARA(Modifier[Parameters]):
                     bad_input = bad_input.float().to(lora_A.device)
                     bad_output = bad_output.float().to(lora_A.device)
 
+                    # ARA matches the raw weight product (input @ W.T), so it assumes
+                    # the linear modules carry no bias. This holds for the o_proj /
+                    # down_proj modules ARA targets across essentially all current LLMs,
+                    # and makes the captured module output exactly input @ W_base.T --
+                    # the constant term the closure adds the low-rank update to.
+                    assert module.base_layer.bias is None, (
+                        "ARA assumes bias-free linear modules"
+                    )
+
                     def objective(A: Tensor, B: Tensor) -> Tensor:
-                        # Calculate effective weight after applying adapter.
-                        W_eff = W_base + (B @ A)
+                        # input @ (W_base + B @ A).T
+                        #   = input @ W_base.T + (input @ A.T) @ B.T
+                        # The first term is the (constant) captured output, so only the
+                        # low-rank second term is recomputed. This avoids materializing
+                        # the dense effective weight and the full input @ W_eff.T product
+                        # on every closure evaluation.
+                        new_good_output = good_output + (good_input @ A.T) @ B.T
+                        new_bad_output = bad_output + (bad_input @ A.T) @ B.T
 
                         if self.settings.preserve_row_magnitudes:
-                            # Normalize to unit length, then scale by original norms,
-                            # preserving the original row norms.
-                            W_eff = F.normalize(W_eff, p=2, dim=1) * W_row_norms
-
-                        # Compute outputs using the effective weight.
-                        new_good_output = good_input @ W_eff.T
-                        new_bad_output = bad_input @ W_eff.T
+                            # Row normalization rescales each output row by
+                            # (original row norm / effective row norm), which applies
+                            # directly to the outputs as a per-column factor.
+                            eff_row_norms = LA.vector_norm(W_base + (B @ A), dim=1)
+                            scale = W_row_norms.squeeze(1) / eff_row_norms
+                            new_good_output = new_good_output * scale
+                            new_bad_output = new_bad_output * scale
 
                         return ara_loss(
                             good_output,
